@@ -3,29 +3,61 @@ Speech Recognizer Module
 DTW 기반 음성 인식기
 """
 
+import logging
 import numpy as np
 from typing import Tuple, List, Dict, Optional
 import pickle
 from pathlib import Path
 
+log = logging.getLogger(__name__)
+
 
 class SpeechRecognizer:
     """
-    DTW 기반 음성 인식기
-    
-    템플릿 매칭 방식으로 음성을 인식합니다.
+    DTW 기반 음성 인식기.
+
+    스코어 정책 (기본값은 권장 모드):
+        normalize=True
+            DTW 거리를 정렬 경로 길이로 나누어 비교 (시퀀스 길이 차의 영향 제거).
+        score_aggregation='min'
+            레이블 점수를 그 레이블 템플릿들과의 거리 중 최소값으로 결정.
+            노이즈 템플릿이 있어도 평균이 끌려가지 않아 강건.
+        score_aggregation='mean'
+            레이블별 평균 거리. 호환 모드 (이전 기본 동작).
+        score_aggregation='knn'
+            레이블 무관 전체 템플릿에서 가장 가까운 ``knn_k`` 개로 다수결.
+            동률은 평균 거리가 작은 쪽 우선.
     """
-    
-    def __init__(self, mfcc_extractor, dtw_algorithm):
-        """
-        Args:
-            mfcc_extractor: MFCC 특징 추출기
-            dtw_algorithm: DTW 알고리즘
-        """
+
+    _VALID_AGG = ("min", "mean", "knn")
+
+    def __init__(
+        self,
+        mfcc_extractor,
+        dtw_algorithm,
+        normalize: bool = True,
+        score_aggregation: str = "min",
+        knn_k: int = 3,
+    ):
+        if score_aggregation not in self._VALID_AGG:
+            raise ValueError(
+                f"Unknown score_aggregation: {score_aggregation!r}. "
+                f"Choose one of {self._VALID_AGG}"
+            )
         self.mfcc_extractor = mfcc_extractor
         self.dtw_algorithm = dtw_algorithm
+        self.normalize = bool(normalize)
+        self.score_aggregation = score_aggregation
+        self.knn_k = max(1, int(knn_k))
         self.templates = {}  # {label: [features, ...]}
         self.template_metadata = {}  # {label: [metadata, ...]}
+
+    def _pairwise_distance(self, x: np.ndarray, y: np.ndarray) -> float:
+        """Compute the (optionally normalized) DTW distance between two feature seqs."""
+        if self.normalize:
+            return float(self.dtw_algorithm.compute_dtw_normalized(x, y))
+        distance, _, _ = self.dtw_algorithm.compute_dtw(x, y)
+        return float(distance)
     
     def add_template(
         self,
@@ -50,7 +82,7 @@ class SpeechRecognizer:
         self.templates[label].append(features)
         self.template_metadata[label].append(metadata or {})
         
-        print(f"✓ Template added: '{label}' - shape {features.shape}")
+        log.info("template added: %r shape=%s", label, features.shape)
     
     def add_template_from_array(
         self,
@@ -101,7 +133,7 @@ class SpeechRecognizer:
         if label in self.templates and self.templates[label]:
             self.templates[label].pop(index)
             self.template_metadata[label].pop(index)
-            print(f"✓ Template removed: '{label}' at index {index}")
+            log.info("template removed: %r at index %d", label, index)
     
     def recognize(
         self,
@@ -168,37 +200,70 @@ class SpeechRecognizer:
         """
         if not self.templates:
             raise ValueError("No templates available. Add templates first.")
-        
-        # 각 템플릿과 비교
-        scores = {}
-        
+
+        if self.score_aggregation == "knn":
+            return self._recognize_knn(test_features, return_scores, top_k)
+
+        # min / mean: 레이블별로 템플릿 거리 집계
+        scores: Dict[str, float] = {}
         for label, template_list in self.templates.items():
-            distances = []
-            
-            for template in template_list:
-                distance, _, _ = self.dtw_algorithm.compute_dtw(
-                    test_features,
-                    template
-                )
-                distances.append(distance)
-            
-            # 해당 레이블의 평균 거리
-            scores[label] = np.mean(distances)
-        
-        # 거리로 정렬 (오름차순)
+            distances = [
+                self._pairwise_distance(test_features, t) for t in template_list
+            ]
+            if self.score_aggregation == "min":
+                scores[label] = float(np.min(distances))
+            else:  # mean
+                scores[label] = float(np.mean(distances))
+
         sorted_scores = sorted(scores.items(), key=lambda x: x[1])
-        
-        # 상위 k개 결과
         top_k_results = sorted_scores[:top_k]
-        
-        # 최상위 예측
         predicted_label = top_k_results[0][0]
         min_distance = top_k_results[0][1]
-        
+
         if return_scores:
             return predicted_label, min_distance, scores, top_k_results
-        else:
-            return predicted_label, min_distance
+        return predicted_label, min_distance
+
+    def _recognize_knn(
+        self,
+        test_features: np.ndarray,
+        return_scores: bool,
+        top_k: int,
+    ) -> Tuple:
+        """KNN 집계: 전체 템플릿 중 가장 가까운 k개로 다수결."""
+        pairs: List[Tuple[str, float]] = []
+        for label, template_list in self.templates.items():
+            for tpl in template_list:
+                pairs.append((label, self._pairwise_distance(test_features, tpl)))
+
+        pairs.sort(key=lambda p: p[1])
+        k = min(self.knn_k, len(pairs))
+        neighbors = pairs[:k]
+
+        votes: Dict[str, int] = {}
+        for label, _ in neighbors:
+            votes[label] = votes.get(label, 0) + 1
+
+        # 레이블별 평균 거리 (이웃에 없는 레이블은 inf)
+        label_scores: Dict[str, float] = {}
+        for label in self.templates:
+            ds = [d for lbl, d in neighbors if lbl == label]
+            label_scores[label] = float(np.mean(ds)) if ds else float("inf")
+
+        # 표 우선, 동률은 평균 거리 작은 쪽
+        predicted_label = sorted(
+            votes.keys(),
+            key=lambda lbl: (-votes[lbl], label_scores[lbl]),
+        )[0]
+        # 반환 distance: 예측 레이블의 가장 가까운 이웃 거리
+        nearest_distance = next(d for lbl, d in pairs if lbl == predicted_label)
+
+        sorted_scores = sorted(label_scores.items(), key=lambda x: x[1])
+        top_k_results = sorted_scores[:top_k]
+
+        if return_scores:
+            return predicted_label, nearest_distance, label_scores, top_k_results
+        return predicted_label, nearest_distance
     
     def get_template_count(self) -> Dict[str, int]:
         """각 클래스의 템플릿 개수 반환"""
@@ -223,7 +288,7 @@ class SpeechRecognizer:
         with open(filepath, 'wb') as f:
             pickle.dump(save_data, f)
         
-        print(f"✓ Templates saved to {filepath}")
+        log.info("templates saved to %s", filepath)
     
     def load_templates(self, filepath: str):
         """
@@ -238,10 +303,12 @@ class SpeechRecognizer:
         self.templates = save_data['templates']
         self.template_metadata = save_data.get('metadata', {})
         
-        print(f"✓ Templates loaded from {filepath}")
-        print(f"  Loaded {len(self.templates)} classes:")
-        for label, count in self.get_template_count().items():
-            print(f"    - {label}: {count} templates")
+        log.info(
+            "templates loaded from %s: %d classes %s",
+            filepath,
+            len(self.templates),
+            self.get_template_count(),
+        )
 
 
 class EnsembleRecognizer:

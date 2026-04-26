@@ -1,3 +1,21 @@
+# Datasets (do not commit)
+backend/data/mini_speech_commands/
+backend/data/mini_speech_commands.zip
+backend/data/templates.pkl
+backend/data/templates.pkl.bak
+backend/data/__MACOSX/
+backend/data/store.db
+backend/data/store.db-*
+backend/data/templates/
+backend/data/backups/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/.vite/
+frontend/*.local
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
